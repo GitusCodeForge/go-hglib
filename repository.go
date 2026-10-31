@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,7 +31,9 @@ type LocalHgRepository struct {
 	Requirements      []string
 	StoreRequirements []string
 	DotEncode         bool
+	PlainEncode       bool
 	Fncache           bool
+	FileIndexV1       bool
 
 	Config      *HGRC
 	Description string
@@ -126,8 +127,23 @@ func NewLocalHgRepository(p string) (*LocalHgRepository, error) {
 	if len(r.StoreRequirements) == 0 {
 		r.StoreRequirements = r.Requirements
 	}
-	r.DotEncode = hasRequirement(r.StoreRequirements, "dotencode")
+	for _, req := range r.StoreRequirements {
+		if strings.HasPrefix(req, "exp-revlogv2.") && req != "exp-revlogv2.2" {
+			return nil, fmt.Errorf("%w: unsupported revlog v2 requirement %q",
+				ErrUnsupportedRevlog, req)
+		}
+	}
+	r.PlainEncode = hasRequirement(r.StoreRequirements, "plain-encode")
+	r.FileIndexV1 = hasRequirement(r.StoreRequirements, "fileindex-v1")
 	r.Fncache = hasRequirement(r.StoreRequirements, "fncache")
+	// A fileindex store defaults to dotencode unless the (experimental) plain
+	// encoding requirement is present. Version 2 repositories use fileindex-v1
+	// and therefore no longer carry a dotencode requirement of their own.
+	r.DotEncode = hasRequirement(r.StoreRequirements, "dotencode") ||
+		(r.FileIndexV1 && !r.PlainEncode)
+	if r.PlainEncode {
+		r.DotEncode = false
+	}
 
 	shared, err := readSharedPath(hg)
 	if err != nil {
@@ -175,8 +191,7 @@ func InitLocalHgRepository(p string) (*LocalHgRepository, error) {
 	if err := os.MkdirAll(p, 0755); err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("hg", "init", p)
-	cmd.Env = hgEnv()
+	cmd := hgCommand("init", p)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("hg init: %s: %s", err, strings.TrimSpace(string(out)))
@@ -349,7 +364,12 @@ func (r *LocalHgRepository) GetCommit(revOrNode string) (*CommitObject, error) {
 		return r.GetCommitByNode(p1)
 	}
 	if n, err := strconv.Atoi(s); err == nil {
-		return r.GetCommitByRev(n)
+		// A decimal string is a revision number when such a revision exists.
+		// Otherwise it may still be an all-digit node prefix, which is resolved
+		// below.
+		if n >= 0 && n < r.Changelog.Len() {
+			return r.GetCommitByRev(n)
+		}
 	}
 	if IsValidNode(s) {
 		rev, ok := r.Changelog.RevOfNode(s)

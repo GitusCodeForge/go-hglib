@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -210,9 +209,8 @@ func (r *LocalHgRepository) addFilesToRepo(
 }
 
 func runHgCommand(dir string, args ...string) (string, error) {
-	cmd := exec.Command("hg", args...)
+	cmd := hgCommand(args...)
 	cmd.Dir = dir
-	cmd.Env = hgEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

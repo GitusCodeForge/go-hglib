@@ -62,6 +62,10 @@ func bytesToHex(b []byte) string {
 	return hex.EncodeToString(b)
 }
 
+func readUint16BE(b []byte) uint16 {
+	return uint16(b[0])<<8 | uint16(b[1])
+}
+
 func readUint32BE(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }

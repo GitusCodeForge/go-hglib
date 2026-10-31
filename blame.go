@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -58,13 +57,12 @@ func (r *LocalHgRepository) Blame(c *CommitObject, filePath string) (*PorcelainB
 
 // BlameAtRev is Blame for a changelog revision number.
 func (r *LocalHgRepository) BlameAtRev(rev int, filePath string) (*PorcelainBlame, error) {
-	cmd := exec.Command("hg", "annotate",
+	cmd := hgCommand("annotate",
 		"-r", strconv.Itoa(rev),
 		"-T", "json",
 		"-n", "-c", "-u", "-d",
 		"--", filePath)
 	cmd.Dir = r.RootPath
-	cmd.Env = hgEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

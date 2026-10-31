@@ -113,16 +113,16 @@ func (r *LocalHgRepository) OpenFilelog(filePath string) (*Revlog, error) {
 	r.filelogsMu.Unlock()
 
 	logical := filelogLogicalPath(filePath)
-	encoded := EncodeStorePath(logical, r.DotEncode)
+	encoded := r.encodeStorePath(logical)
 	full := localPath(r.StorePath, encoded)
-	rl, err := OpenRevlog(full)
+	rl, err := openRevlog(full, logical, r.StorePath, r.encodeStorePath)
 	if err != nil {
 		// Narrow repositories and some internal stores keep metadata-only
 		// filelogs under meta/ instead of data/.
 		metaLogical := "meta/" + filePath + ".i"
-		metaFull := localPath(r.StorePath, EncodeStorePath(metaLogical, r.DotEncode))
+		metaFull := localPath(r.StorePath, r.encodeStorePath(metaLogical))
 		if _, statErr := os.Stat(metaFull); statErr == nil {
-			rl, err = OpenRevlog(metaFull)
+			rl, err = openRevlog(metaFull, metaLogical, r.StorePath, r.encodeStorePath)
 		}
 	}
 	if err != nil {
@@ -138,6 +138,14 @@ func (r *LocalHgRepository) OpenFilelog(filePath string) (*Revlog, error) {
 	r.filelogs[filePath] = rl
 	r.filelogsMu.Unlock()
 	return rl, nil
+}
+
+// encodeStorePath applies this repository's store encoding to a logical path.
+func (r *LocalHgRepository) encodeStorePath(path string) string {
+	if r.PlainEncode {
+		return plainEncodeStorePath(path)
+	}
+	return EncodeStorePath(path, r.DotEncode)
 }
 
 // HasFilelog reports whether a repository file has a filelog on disk.
@@ -228,6 +236,11 @@ func (r *LocalHgRepository) GetFileContent(c *CommitObject, filePath string) ([]
 // the repository has no fncache, walks the data directory. The result is
 // sorted and repository-root-relative.
 func (r *LocalHgRepository) GetAllTrackedFiles() ([]string, error) {
+	if r.FileIndexV1 {
+		if paths, ok := r.readFileIndexPaths(); ok {
+			return paths, nil
+		}
+	}
 	fncache := localPath(r.StorePath, "fncache")
 	if data, err := os.ReadFile(fncache); err == nil {
 		res := make([]string, 0, 64)

@@ -241,6 +241,16 @@ func EncodeStorePath(path string, dotencode bool) string {
 	return res
 }
 
+// plainEncodeStorePath is Mercurial's store._plain_encode, the experimental
+// "very fragile and unsafe" encoding used by fileindex stores that also set
+// the plain-encode requirement. Directory separators below data/ become "_/".
+func plainEncodeStorePath(path string) string {
+	if strings.HasPrefix(path, "data/") {
+		return "data/" + strings.ReplaceAll(path[len("data/"):], "/", "_/")
+	}
+	return path
+}
+
 // filelogLogicalPath returns the store path of the filelog for a
 // repository-relative file.
 func filelogLogicalPath(filePath string) string {

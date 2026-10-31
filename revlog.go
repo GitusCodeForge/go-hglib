@@ -35,6 +35,21 @@ const (
 	cacheEntryLimit = 256
 )
 
+// Revision chunk compression modes used by version 2 indexes. Version 0 and 1
+// always use compModeInline.
+const (
+	compModePlain   = 0
+	compModeDefault = 1
+	compModeInline  = 2
+)
+
+// Size of the fixed part of a version 2 docket header:
+// 4 bytes version, six 1-byte UUID sizes/counts, six 8-byte lengths and one
+// byte of default compression header.
+const revlogV2DocketHeaderSize = 59
+
+const revlogUIDSize = 8
+
 var (
 	ErrRevlogNotFound         = errors.New("mercurial revlog not found")
 	ErrRevNotFound            = errors.New("mercurial revision not found")
@@ -55,16 +70,24 @@ type RevlogEntry struct {
 	Flags       uint16
 	// CompressedLen is the number of bytes the chunk occupies on disk.
 	CompressedLen int32
-	// UncompressedLen is the size of the chunk before compression. It is the
-	// size of the delta, not of the reconstructed revision, for a delta.
+	// UncompressedLen is the size of the full reconstructed revision, not of
+	// the stored chunk after decompression. For a delta the chunk itself is
+	// usually much smaller; -1 means unknown (version 0 has no such field).
 	UncompressedLen int32
 	// BaseRev is the revision this revision is a delta against. A fulltext
-	// revision has BaseRev == its own revision number.
+	// revision has BaseRev == its own revision number. In a non-generaldelta
+	// revlog it is the first revision of the delta chain.
 	BaseRev int32
 	LinkRev int32
 	P1      int32
 	P2      int32
 	Node    string
+	// The following fields only exist in version 2 indexes.
+	SidedataOffset          int64
+	SidedataCompressedLen   int32
+	DataCompressionMode     uint8
+	SidedataCompressionMode uint8
+	Rank                    int32
 }
 
 // IsFullText reports whether the entry stores a complete revision instead of
@@ -77,22 +100,54 @@ func (e RevlogEntry) IsFullText(rev int) bool {
 // Revlog is a parsed Mercurial revlog. Changelog, manifest and every filelog
 // use this same format.
 type Revlog struct {
-	IndexPath     string
-	DataPath      string
+	// IndexPath is the path passed to OpenRevlog. For version 2 this is the
+	// docket file (for example 00changelog.i), not the UUID-named .idx file.
+	IndexPath string
+	// DataPath is the file holding revision chunks: .d for version 0/1, or
+	// the UUID-named .dat for version 2.
+	DataPath string
+	// SidedataPath is the UUID-named .sda file of a version 2 revlog, when
+	// the docket names one. It is not read by this package.
+	SidedataPath string
+
 	FormatVersion int
 	FormatFlags   uint32
 	Inline        bool
 	GeneralDelta  bool
 	EntrySize     int
-	Entries       []RevlogEntry
+	V2            bool
+	ChangelogV2   bool
+
+	// DefaultCompressionHeader is the one-byte engine header stored in a
+	// version 2 docket. It is used by chunks whose compression mode is
+	// compModeDefault.
+	DefaultCompressionHeader byte
+
+	Entries []RevlogEntry
 
 	indexData []byte
 	dataFile  *os.File
 	nodeMap   map[string]int
 
+	// logicalIndexPath is the path before store encoding. For changelog and
+	// manifest it is the same as IndexPath; for filelogs it is the logical
+	// "data/<file>.i" name. encodePath and storeRoot turn logical UUID / .d
+	// names into paths on disk. Long paths can hash differently once a suffix
+	// is appended, so concatenating to the encoded docket name is not enough.
+	logicalIndexPath string
+	storeRoot        string
+	encodePath       func(string) string
+
 	cacheMu sync.Mutex
 	cache   map[int][]byte
 	order   []int
+}
+
+func (r *Revlog) resolveStorePath(logical string) string {
+	if r.encodePath != nil && r.storeRoot != "" {
+		return localPath(r.storeRoot, r.encodePath(logical))
+	}
+	return logical
 }
 
 // OpenRevlogOrEmpty is OpenRevlog, but a missing index yields an empty revlog
@@ -119,6 +174,13 @@ func OpenRevlogOrEmpty(indexPath string) (*Revlog, error) {
 // OpenRevlog reads and parses a revlog index. The index is kept in memory;
 // data for a non-inline revlog stays on disk and is read on demand.
 func OpenRevlog(indexPath string) (*Revlog, error) {
+	return openRevlog(indexPath, indexPath, "", nil)
+}
+
+// openRevlog is OpenRevlog with the information needed to reconstruct
+// version 2 UUID file names and non-inline data names. logicalIndexPath is the
+// path before store encoding; storeRoot and encodePath are set for filelogs.
+func openRevlog(indexPath, logicalIndexPath, storeRoot string, encodePath func(string) string) (*Revlog, error) {
 	data, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -127,17 +189,20 @@ func OpenRevlog(indexPath string) (*Revlog, error) {
 		return nil, err
 	}
 	r := &Revlog{
-		IndexPath: indexPath,
-		EntrySize: revlogV1Size,
-		indexData: data,
-		nodeMap:   make(map[string]int),
-		cache:     make(map[int][]byte),
+		IndexPath:        indexPath,
+		EntrySize:        revlogV1Size,
+		indexData:        data,
+		nodeMap:          make(map[string]int),
+		cache:            make(map[int][]byte),
+		logicalIndexPath: logicalIndexPath,
+		storeRoot:        storeRoot,
+		encodePath:       encodePath,
 	}
 	if len(data) == 0 {
 		// An empty revlog has no header word at all. Mercurial treats it as
 		// the default version.
 		r.FormatVersion = revlogV1
-		r.DataPath = strings.TrimSuffix(indexPath, ".i") + ".d"
+		r.DataPath = r.resolveStorePath(strings.TrimSuffix(r.logicalIndexPath, ".i") + ".d")
 		return r, nil
 	}
 	if len(data) < 4 {
@@ -159,24 +224,43 @@ func OpenRevlog(indexPath string) (*Revlog, error) {
 		r.Inline = false
 		r.GeneralDelta = false
 	case revlogV2, changelogV2:
-		return nil, fmt.Errorf("%w: revlog version %#x", ErrUnsupportedRevlog, r.FormatVersion)
+		r.V2 = true
+		r.ChangelogV2 = r.FormatVersion == changelogV2
+		r.EntrySize = revlogV2Size
+		// Version 2 stores data in a separate UUID-named .dat file and always
+		// uses generaldelta.
+		r.Inline = false
+		r.GeneralDelta = true
+		err = r.openV2(data)
 	default:
 		return nil, fmt.Errorf("%w: revlog version %#x", ErrUnsupportedRevlog, r.FormatVersion)
-	}
-
-	if r.FormatVersion == revlogV0 {
-		err = r.parseV0Index()
-		r.DataPath = strings.TrimSuffix(indexPath, ".i") + ".d"
-	} else if r.Inline {
-		err = r.parseInlineIndex()
-		r.DataPath = indexPath
-	} else {
-		err = r.parseSplitIndex()
-		r.DataPath = strings.TrimSuffix(indexPath, ".i") + ".d"
 	}
 	if err != nil {
 		return nil, err
 	}
+
+	if !r.V2 {
+		if r.FormatVersion == revlogV0 {
+			err = r.parseV0Index()
+			r.DataPath = r.resolveStorePath(strings.TrimSuffix(r.logicalIndexPath, ".i") + ".d")
+		} else if r.Inline {
+			err = r.parseInlineIndex()
+			r.DataPath = indexPath
+		} else {
+			err = r.parseSplitIndex()
+			r.DataPath = r.resolveStorePath(strings.TrimSuffix(r.logicalIndexPath, ".i") + ".d")
+		}
+		if err != nil {
+			return nil, err
+		}
+		// The defaults above were applied before parsing, so apply them again
+		// to the entries that were just added.
+		for i := range r.Entries {
+			r.Entries[i].DataCompressionMode = compModeInline
+			r.Entries[i].Rank = -1
+		}
+	}
+
 	if !r.Inline && len(r.Entries) > 0 {
 		f, err := os.Open(r.DataPath)
 		if err != nil {
@@ -231,6 +315,213 @@ func (r *Revlog) parseV0Index() error {
 		}
 		if rev, ok := r.nodeMap[bytesToHex(b[36:56])]; ok {
 			e.P2 = int32(rev)
+		}
+		r.Entries = append(r.Entries, e)
+		if _, ok := r.nodeMap[e.Node]; !ok {
+			r.nodeMap[e.Node] = i
+		}
+	}
+	return nil
+}
+
+// revlogV2Docket is the small header file that version 2 revlogs keep at the
+// old .i path. It points at UUID-named index, data and sidedata files.
+type revlogV2Docket struct {
+	VersionHeader            uint32
+	IndexUUID                string
+	DataUUID                 string
+	SidedataUUID             string
+	IndexEnd                 uint64
+	PendingIndexEnd          uint64
+	DataEnd                  uint64
+	PendingDataEnd           uint64
+	SidedataEnd              uint64
+	PendingSidedataEnd       uint64
+	DefaultCompressionHeader byte
+}
+
+// parseV2Docket parses the fixed header and the variable UUID lists of a
+// version 2 docket. The garbage list that follows (used by the file index, not
+// by revlogs) is not needed here.
+func parseV2Docket(data []byte) (*revlogV2Docket, error) {
+	if len(data) < revlogV2DocketHeaderSize {
+		return nil, fmt.Errorf("%w: version 2 docket is too short", ErrUnsupportedRevlog)
+	}
+	d := &revlogV2Docket{
+		VersionHeader:            readUint32BE(data[0:4]),
+		IndexEnd:                 readUint64BE(data[10:18]),
+		PendingIndexEnd:          readUint64BE(data[18:26]),
+		DataEnd:                  readUint64BE(data[26:34]),
+		PendingDataEnd:           readUint64BE(data[34:42]),
+		SidedataEnd:              readUint64BE(data[42:50]),
+		PendingSidedataEnd:       readUint64BE(data[50:58]),
+		DefaultCompressionHeader: data[58],
+	}
+	idxSize := int(data[4])
+	olderIdxCount := int(data[5])
+	dataSize := int(data[6])
+	olderDataCount := int(data[7])
+	sideSize := int(data[8])
+	olderSideCount := int(data[9])
+
+	off := revlogV2DocketHeaderSize
+	read := func(n int) ([]byte, error) {
+		if n < 0 || off+n > len(data) {
+			return nil, fmt.Errorf("%w: version 2 docket is truncated", ErrUnsupportedRevlog)
+		}
+		b := data[off : off+n]
+		off += n
+		return b, nil
+	}
+	readUUID := func(n int) (string, error) {
+		b, err := read(n)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	type oldUID struct {
+		size     int
+		fileSize uint32
+	}
+	readOldUIDs := func(count int) ([]oldUID, error) {
+		res := make([]oldUID, count)
+		for i := range res {
+			b, err := read(5)
+			if err != nil {
+				return nil, err
+			}
+			res[i].size = int(b[0])
+			res[i].fileSize = readUint32BE(b[1:5])
+		}
+		for i := range res {
+			if _, err := read(res[i].size); err != nil {
+				return nil, err
+			}
+		}
+		return res, nil
+	}
+
+	var err error
+	d.IndexUUID, err = readUUID(idxSize)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = readOldUIDs(olderIdxCount); err != nil {
+		return nil, err
+	}
+	d.DataUUID, err = readUUID(dataSize)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = readOldUIDs(olderDataCount); err != nil {
+		return nil, err
+	}
+	d.SidedataUUID, err = readUUID(sideSize)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = readOldUIDs(olderSideCount); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+func (r *Revlog) openV2(docketData []byte) error {
+	d, err := parseV2Docket(docketData)
+	if err != nil {
+		return err
+	}
+	if int(d.VersionHeader&0xFFFF) != r.FormatVersion {
+		return fmt.Errorf("%w: docket version %#x does not match revlog version %#x",
+			ErrUnsupportedRevlog, d.VersionHeader&0xFFFF, r.FormatVersion)
+	}
+	logicalRadix := strings.TrimSuffix(r.logicalIndexPath, ".i")
+	r.DefaultCompressionHeader = d.DefaultCompressionHeader
+	if d.IndexEnd > 0 {
+		if d.IndexUUID == "" {
+			return fmt.Errorf("%w: version 2 docket has no index UUID", ErrUnsupportedRevlog)
+		}
+		idxPath := r.resolveStorePath(logicalRadix + "-" + d.IndexUUID + ".idx")
+		idx, err := os.ReadFile(idxPath)
+		if err != nil {
+			return err
+		}
+		if uint64(len(idx)) < d.IndexEnd {
+			return fmt.Errorf("%w: %s is shorter than the docket's index size", ErrUnsupportedRevlog, idxPath)
+		}
+		r.indexData = idx[:d.IndexEnd]
+		if err := r.parseV2Index(); err != nil {
+			return err
+		}
+	}
+	if d.DataUUID != "" {
+		r.DataPath = r.resolveStorePath(logicalRadix + "-" + d.DataUUID + ".dat")
+	}
+	if d.SidedataUUID != "" {
+		r.SidedataPath = r.resolveStorePath(logicalRadix + "-" + d.SidedataUUID + ".sda")
+	}
+	if len(r.Entries) > 0 && r.DataPath == "" {
+		return fmt.Errorf("%w: version 2 docket has no data UUID", ErrUnsupportedRevlog)
+	}
+	return nil
+}
+
+// parseV2Index parses 96-byte version 2 index entries. The two layouts differ:
+// a normal revlog stores base and link revisions, while the changelog layout
+// omits them (every changelog revision is a fulltext whose base and link are
+// its own revision) and adds a rank field.
+func (r *Revlog) parseV2Index() error {
+	if len(r.indexData)%revlogV2Size != 0 {
+		return fmt.Errorf("%w: %s has a partial version 2 index entry", ErrUnsupportedRevlog, r.IndexPath)
+	}
+	n := len(r.indexData) / revlogV2Size
+	r.Entries = make([]RevlogEntry, 0, n)
+	for i := 0; i < n; i++ {
+		b := r.indexData[i*revlogV2Size : (i+1)*revlogV2Size]
+		q := readUint64BE(b[0:8])
+		e := RevlogEntry{
+			Offset:          int64(q >> 16),
+			IndexOffset:     int64(i * revlogV2Size),
+			Flags:           uint16(q & 0xFFFF),
+			CompressedLen:   readInt32BE(b[8:12]),
+			UncompressedLen: readInt32BE(b[12:16]),
+			Rank:            -1,
+		}
+		var compModeByte byte
+		if r.ChangelogV2 {
+			// 8 offset/flags, 4+4 lengths, 4+4 parents, 20 node,
+			// 12 padding, 8 sidedata offset, 4 sidedata length,
+			// 1 compression modes, 4 rank, 23 padding.
+			e.P1 = readInt32BE(b[16:20])
+			e.P2 = readInt32BE(b[20:24])
+			e.Node = bytesToHex(b[24:44])
+			e.BaseRev = int32(i)
+			e.LinkRev = int32(i)
+			e.SidedataOffset = int64(readUint64BE(b[56:64]))
+			e.SidedataCompressedLen = readInt32BE(b[64:68])
+			compModeByte = b[68]
+			e.Rank = readInt32BE(b[69:73])
+		} else {
+			// 8 offset/flags, 4+4 lengths, 4+4 base/link, 4+4 parents,
+			// 20 node, 12 padding, 8 sidedata offset, 4 sidedata length,
+			// 1 compression modes, 19 padding.
+			e.BaseRev = readInt32BE(b[16:20])
+			e.LinkRev = readInt32BE(b[20:24])
+			e.P1 = readInt32BE(b[24:28])
+			e.P2 = readInt32BE(b[28:32])
+			e.Node = bytesToHex(b[32:52])
+			e.SidedataOffset = int64(readUint64BE(b[64:72]))
+			e.SidedataCompressedLen = readInt32BE(b[72:76])
+			compModeByte = b[76]
+		}
+		e.DataCompressionMode = compModeByte & 3
+		e.SidedataCompressionMode = (compModeByte >> 2) & 3
+		if e.DataCompressionMode > compModeInline {
+			return fmt.Errorf("%w: unknown data compression mode %d", ErrUnsupportedCompression, e.DataCompressionMode)
+		}
+		if e.CompressedLen < 0 || e.UncompressedLen < 0 || e.Offset < 0 {
+			return fmt.Errorf("%w: negative field in version 2 revlog entry", ErrUnsupportedRevlog)
 		}
 		r.Entries = append(r.Entries, e)
 		if _, ok := r.nodeMap[e.Node]; !ok {
@@ -475,6 +766,24 @@ func zstdDecompress(data []byte) ([]byte, error) {
 	return zstdDecoder.DecodeAll(data, nil)
 }
 
+// decompressChunkData applies the compression mode recorded in a version 2
+// index entry. Version 0 and 1 entries always use compModeInline.
+func (r *Revlog) decompressChunkData(data []byte, mode uint8) ([]byte, error) {
+	switch mode {
+	case compModePlain:
+		return data, nil
+	case compModeDefault:
+		if r.DefaultCompressionHeader == 0 {
+			return data, nil
+		}
+		return decompressChunk(data)
+	case compModeInline:
+		return decompressChunk(data)
+	default:
+		return nil, fmt.Errorf("%w: compression mode %d", ErrUnsupportedCompression, mode)
+	}
+}
+
 func decompressChunk(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, nil
@@ -581,11 +890,11 @@ func (r *Revlog) decompressedChunk(rev int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := decompressChunk(raw)
+	e := &r.Entries[rev]
+	out, err := r.decompressChunkData(raw, e.DataCompressionMode)
 	if err != nil {
 		return nil, err
 	}
-	e := &r.Entries[rev]
 	// UncompressedLen is the size of the full reconstructed revision, not of
 	// the stored chunk, so it only describes this chunk when the revision is
 	// a fulltext.

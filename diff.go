@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -291,9 +290,8 @@ func (r *LocalHgRepository) GetDiff(commitId string) (*Diff, error) {
 
 // GetDiffRev is GetDiff for a changelog revision number.
 func (r *LocalHgRepository) GetDiffRev(rev int) (*Diff, error) {
-	cmd := exec.Command("hg", "diff", "--git", "--nodates", "-c", strconv.Itoa(rev))
+	cmd := hgCommand("diff", "--git", "--nodates", "-c", strconv.Itoa(rev))
 	cmd.Dir = r.RootPath
-	cmd.Env = hgEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -313,9 +311,8 @@ func (r *LocalHgRepository) GetDiffRev(rev int) (*Diff, error) {
 
 // GetDiffBetween returns the diff between two revisions.
 func (r *LocalHgRepository) GetDiffBetween(fromRev, toRev string) (*Diff, error) {
-	cmd := exec.Command("hg", "diff", "--git", "--nodates", "-r", fromRev, "-r", toRev)
+	cmd := hgCommand("diff", "--git", "--nodates", "-r", fromRev, "-r", toRev)
 	cmd.Dir = r.RootPath
-	cmd.Env = hgEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

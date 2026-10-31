@@ -102,6 +102,11 @@ if check.Successful {
 * Revlog version 0 (the pre-2006 format, 76-byte entries with node-id parents)
   and version 1 indexes, both inline (`00manifest.i` usually) and split
   index/data files (`.i` / `.d`).
+* Revlog version 2 (`0xDEAD`) and changelog version 2 (`0xD34D`): docket
+  files, UUID-named `.idx` / `.dat` / `.sda` files, 96-byte index entries and
+  the plain / default / inline chunk compression modes.
+* `fileindex-v1` enumeration, including paths whose store name is hashed.
+* The experimental `plain-encode` store layout.
 * `generaldelta` and non-`generaldelta` delta chains. Mercurial's own patch
   format is applied directly, so no `hg` process is needed to reconstruct a
   revision.
@@ -129,14 +134,15 @@ if check.Successful {
 
 ## Not implemented
 
-* The experimental revlog/changelog version 2 formats. Version 2 is not the
-  default and is not written by normal repositories: Mercurial's own
-  `hg help internals.revlogs` calls it "in-development", calls `0xDEAD`
-  "reserved for internal testing", and enabling it requires setting
-  `format.exp-use-changelog-v2` or `experimental.revlogv2` to
-  `enable-unstable-format-and-corrupt-my-data`. It also uses a docket file and
-  UUID-named `.idx` / `.dat` / `.sda` files rather than `.i` / `.d`.
-  `OpenRevlog` returns a descriptive error for it.
+* `sidedata` contents. The `.sda` file and its offset/length fields are
+  recognised, but the payload is not parsed. This mainly matters for the
+  experimental `exp-copies-sidedata-changeset` feature, where copy
+  source/rev information lives in sidedata instead of the filelog header;
+  `BlobObject.CopySource` can therefore be empty for such repositories.
+  Version 2 itself is experimental: Mercurial's own help calls it
+  "in-development" and enabling it requires a configuration value literally
+  named `enable-unstable-format-and-corrupt-my-data`. Unknown requirement
+  sub-versions are rejected rather than guessed at.
 * `dirstate` version 2 (`dirstate-v2`).
 * Mercurial's wire protocol (bundle2, `getbundle`, …). This package is for
   local storage.
@@ -193,7 +199,11 @@ Existing revision numbers keep their meaning; new revisions become visible.
 
 The tests create real repositories with the `hg` executable and compare the
 parsed result against `hg log`, `hg manifest --debug`, `hg cat`, `hg diff`,
-`hg annotate` and `hg resolve`.
+`hg annotate` and `hg resolve`. The suite also creates version 2 and
+changelog-v2 repositories with Mercurial's experimental configurations. On
+builds without the Rust file-index extension, those repositories require
+`storage.fileindex.slow-path=allow`; the `hg` helpers in this package add that
+config automatically, and the tests do the same for their own `hg` calls.
 
 ```sh
 go test ./...

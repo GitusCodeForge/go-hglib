@@ -43,9 +43,8 @@ type MergeCheckResult struct {
 }
 
 func runHgCommandStatus(dir string, args ...string) (stdout string, stderr string, exitCode int, err error) {
-	cmd := exec.Command("hg", args...)
+	cmd := hgCommand(args...)
 	cmd.Dir = dir
-	cmd.Env = hgEnv()
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
